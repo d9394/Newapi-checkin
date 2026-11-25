@@ -27,10 +27,17 @@ except ImportError:
     send_checkin_notification = None
 
 try:
-    from notifier import send_email_notification, send_serverchan_notification
+    from notifier import (
+        send_email_notification,
+        send_serverchan_notification,
+        send_webhook_notification,
+        describe_webhook_config,
+    )
 except ImportError:
     send_email_notification = None
     send_serverchan_notification = None
+    send_webhook_notification = None
+    describe_webhook_config = None
 
 try:
     from lottery import run_for_account as lottery_run_for_account
@@ -702,6 +709,19 @@ def load_config_from_cloud(config_url: str, config_auth: str = None) -> Optional
                 if sc.get('sendkey'):
                     print('[云端] 已从云端加载 ServerChan 通知配置')
 
+            if data.get('webhook'):
+                wh = data['webhook']
+                if isinstance(wh, str):
+                    wh = {'url': wh}
+                if wh.get('url') and not os.environ.get('WEBHOOK_URL'):
+                    os.environ['WEBHOOK_URL'] = wh['url']
+                if wh.get('type') and not os.environ.get('WEBHOOK_TYPE'):
+                    os.environ['WEBHOOK_TYPE'] = wh['type']
+                if wh.get('token') and not os.environ.get('WEBHOOK_TOKEN'):
+                    os.environ['WEBHOOK_TOKEN'] = wh['token']
+                if wh.get('url'):
+                    print('[云端] 已从云端加载 Webhook 通知配置')
+
             return accounts_str
         else:
             print('[云端] 配置格式错误: 无法解析账号列表')
@@ -954,8 +974,21 @@ def main():
     notify_only_fail = os.environ.get('NOTIFY_ONLY_FAILURE', '').strip().lower() in ('1', 'true', 'yes')
     if notify_only_fail and fail_count == 0:
         print('\n[通知] 全部签到成功，已开启「仅失败时推送」，跳过通知')
-    elif True:
-        pass
+
+    # 通知渠道自检：排查「为什么没收到推送」时先看这段
+    print()
+    print('-' * 52)
+    print('通知渠道配置检查（Webhook 支持已加载）:')
+    if describe_webhook_config:
+        print('  Webhook    :', describe_webhook_config())
+    else:
+        print('  Webhook    : 模块未加载（notifier.py 导入失败，检查文件是否已提交）')
+    print('  钉钉       :', '已配置' if os.environ.get('DINGTALK_WEBHOOK') else '未配置')
+    print('  邮件       :', '已配置' if os.environ.get('EMAIL_SMTP_HOST') else '未配置')
+    print('  ServerChan :', '已配置' if os.environ.get('SERVERCHAN_SENDKEY') else '未配置')
+    if notify_only_fail:
+        print('  NOTIFY_ONLY_FAILURE = 1（全部成功时不推送）')
+    print('-' * 52)
 
     if send_checkin_notification and not (notify_only_fail and fail_count == 0):
         print('正在发送钉钉通知...')
@@ -976,6 +1009,18 @@ def main():
         send_serverchan_notification(checkin_results, execution_time)
     elif os.environ.get('SERVERCHAN_SENDKEY'):
         print('[警告] 已配置 SERVERCHAN_SENDKEY 但无法导入通知模块')
+
+    # 发送通用 Webhook 通知
+    if not send_webhook_notification:
+        print('[警告] notifier.py 导入失败，Webhook 通知不可用')
+    elif notify_only_fail and fail_count == 0:
+        print('[Webhook] 已开启「仅失败时推送」，跳过')
+    else:
+        print('正在发送 Webhook 通知...')
+        try:
+            send_webhook_notification(checkin_results, execution_time)
+        except Exception as e:
+            print(f'[Webhook] 通知异常（不影响签到结果）: {e}')
 
     # 回写 .env（仅限从 .env 加载且 session 有更新的本地运行）
     if from_env_file and session_updated and not os.environ.get('GITHUB_ACTIONS'):

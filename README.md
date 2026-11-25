@@ -14,6 +14,7 @@
 - ✅ **钉钉通知**（签到完成后自动推送结果）
 - ✅ **邮件通知**（支持 SMTP 发送签到报告）
 - ✅ **Server酱推送**（支持 ServerChan 微信推送）
+- ✅ **通用 Webhook 通知**（POST 表单 / GET 查询串 / POST JSON，支持企业微信、飞书、Bark、Telegram 及自建推送网关）
 - ✅ **Session 自动续期**（过期后自动使用配置的账号密码重新登录，新 session 自动回写 .env）
 - ✅ **重复签到检测**（已签到自动标记成功，避免误报）
 - ✅ **工作流保活**（防止 GitHub Actions 自动禁用）
@@ -349,7 +350,7 @@ schedule:
 
 ### 🔔 通知配置（可选）
 
-签到完成后自动发送通知，支持 **钉钉**、**邮件**、**Server酱** 三种推送方式。
+签到完成后自动发送通知，支持 **钉钉**、**邮件**、**Server酱**、**通用 Webhook** 四种推送方式。
 
 ---
 
@@ -399,6 +400,140 @@ schedule:
 | Secret 名称 | 说明 | 是否必须 |
 |-------------|------|----------|
 | `SERVERCHAN_KEY` | ServerChan SendKey | 是 |
+
+---
+
+#### 通用 Webhook 通知
+
+推送签到报告到你自己的 HTTP 接口，支持四种形态：
+
+1. **GET 查询串**（`WEBHOOK_TYPE=query`）：报告放进 URL 的 `msg` 参数，与浏览器直接访问形态一致，受约 2KB 长度限制并自动截断
+2. **POST 表单**（`WEBHOOK_TYPE=form`）：`Content-Type: application/x-www-form-urlencoded`，body 为 `usr=xxx&from=newapi-checkin&msg=<报告>`，长文本不受 URL 长度限制
+3. **路径占位符**（`WEBHOOK_TYPE=path`）：报告替换 URL 路径里的 `{消息}`，适配 `/api/msg/send/TOKEN/{消息}` 这类接口
+4. **POST JSON**（`WEBHOOK_TYPE=generic`，默认）：向 URL POST 结构化数据
+
+另可设置 `WEBHOOK_FORMAT=short` 只发一行摘要（`📋 NewAPI 签到完成 (成功2/失败1)`），适合 APRS、短信、公众号等长度受限的通道。
+
+##### 添加 GitHub Secrets
+
+| Secret 名称 | 说明 | 是否必须 |
+|-------------|------|----------|
+| `WEBHOOK_URL` | Webhook 地址（含 token 的完整 URL） | 是 |
+| `WEBHOOK_TYPE` | `form` / `query` / `generic` / `wecom` / `dingtalk` / `feishu` / `bark` / `telegram` | 否（留空自动识别） |
+| `WEBHOOK_EXTRA` | 额外的表单参数，如 `usr=YOUR_TOKEN&from=newapi-checkin`（`form` 用） | 否 |
+| `WEBHOOK_FORMAT` | `full`（完整报告，默认）/ `short`（一行摘要） | 否 |
+| `WEBHOOK_TOKEN` | 仅 Telegram 需要：bot token（此时 `WEBHOOK_URL` 填 chat_id） | 否 |
+| `NOTIFY_ONLY_FAILURE` | 设为 `1` 时仅在存在失败账号时推送 | 否 |
+
+##### POST 表单示例（推荐）
+
+```
+WEBHOOK_URL=http://example.com:88/weixin/?usr=YOUR_TOKEN&from=newapi-checkin&msg=消息
+WEBHOOK_TYPE=form
+```
+
+实际发出的请求（路径 `/weixin/` 保留，查询参数被挪进 body）：
+
+```
+POST http://example.com:88/weixin/
+Content-Type: application/x-www-form-urlencoded
+
+usr=YOUR_TOKEN&from=newapi-checkin&msg=<URL 编码后的签到报告>
+```
+
+- URL 查询串里的固定参数（`usr`、`from` 等）会被挪进 body，URL 本身保持干净
+- URL 里已有 `msg=消息` 占位会被**替换**为实际报告，没有则自动追加 `msg=`
+- 不想让 URL 带参数时，用 `WEBHOOK_URL=http://example.com:88/weixin` + `WEBHOOK_EXTRA=usr=YOUR_TOKEN&from=newapi-checkin`，效果相同
+
+##### GET 查询串示例
+
+```
+WEBHOOK_URL=http://example.com:88/weixin/?usr=YOUR_TOKEN&from=newapi-checkin&msg=消息
+WEBHOOK_TYPE=query
+```
+
+与浏览器里直接访问的形态一致：
+
+```
+GET http://example.com:88/weixin/?usr=YOUR_TOKEN&from=newapi-checkin&msg=<报告>
+```
+
+- URL 中已有 `msg=xxx` 会**替换其值**，没有则自动追加 `&msg=`
+- 内容过长时自动截断，保证最终 URL 不超过 1800 字符
+- 若 URL 带 `msg=` / `text=` / `message=` / `content=` 参数且未设置 `WEBHOOK_TYPE`，会自动按此模式发送
+
+##### 本地/CI 验证
+
+不用跑完整签到也能测通接口：
+
+```bash
+# 本地（可自动读取 .env）
+python test_notify.py
+
+# 直接给参数
+WEBHOOK_URL="http://example.com:88/weixin/?usr=YOUR_TOKEN&from=newapi-checkin&msg=消息" \
+WEBHOOK_TYPE=query python test_notify.py
+```
+
+成功返回 `✅ 推送成功`（退出码 0），失败返回 `❌ 推送失败` 并打印脱敏后的原因。
+
+##### 排查：配好了但没收到推送
+
+每次运行签到，汇总之后都会先打印一段**通知渠道配置检查**，直接看这里：
+
+```
+----------------------------------------------------
+通知渠道配置检查（Webhook 支持已加载）:
+  Webhook    : 已配置 type=query http://***:88/weixin/?usr=***&from=***&msg=***
+  钉钉       : 未配置
+  邮件       : 未配置
+  ServerChan : 未配置
+----------------------------------------------------
+```
+
+| 日志现象 | 原因 | 处理 |
+|----------|------|------|
+| 完全没有「通知渠道配置检查」这段 | 补丁未提交/未生效，Actions 跑的还是旧代码 | 确认仓库里 `notifier.py` 有 `send_webhook_notification`，且已 push |
+| 显示 `Webhook : 未配置（缺少环境变量 WEBHOOK_URL）` | Secret 没建，或 workflow 的 `env:` 没映射 | 补 Secret 并确认 `checkin.yml` 里有 `WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}` |
+| 显示 `模块未加载（notifier.py 导入失败）` | `notifier.py` 没提交或语法错误 | 检查文件是否在仓库根目录、能否 `python -c "import notifier"` |
+| 显示已配置但发送失败 | 网络/接口问题，看 `[Webhook] 第 N/3 次推送失败` 的原因 | 用 `test_notify.py` 在本地先验证接口本身 |
+
+##### 路径占位符示例（path）
+
+有些推送网关把消息放在**路径**里，而不是查询参数：
+
+```
+WEBHOOK_URL=http://example.com:8765/api/msg/send/YOUR_TOKEN/{消息}
+WEBHOOK_TYPE=path
+WEBHOOK_FORMAT=short
+```
+
+实际发出的请求：
+
+```
+GET http://example.com:8765/api/msg/send/YOUR_TOKEN/%F0%9F%93%8B%20NewAPI%20%E7%AD%BE%E5%88%B0...
+```
+
+- 支持占位符 `{消息}` / `{msg}` / `{message}` / `{text}` / `{content}`；不带占位符时消息追加到路径末尾
+- 消息整体做百分号编码，里面的 `/` 和换行都会被编码，不会破坏路径层级
+- 超出 1800 字符自动裁剪
+- 这类通道一般装不下完整报告，**建议配 `WEBHOOK_FORMAT=short`**，或账号不多时用完整报告
+
+##### POST JSON 结构（generic）
+
+```json
+{
+  "event": "newapi_checkin",
+  "title": "📋 NewAPI 签到完成 (成功1/失败1)",
+  "content": "Markdown 报告",
+  "text": "纯文本报告",
+  "execution_time": "2026-01-08 08:10:00",
+  "summary": {"total": 2, "success": 1, "fail": 1},
+  "results": [{"name": "主力站", "success": true, "quota_awarded": 500000}]
+}
+```
+
+> **安全提示：** Webhook URL 中的 token 等价于密码。切勿写入代码、README 或 `.env.example`，只放在 GitHub Secrets 或本地 `.env`（已被 `.gitignore` 忽略）。脚本日志中的地址会脱敏为 `https://***/api/msg/send/***/***`、`https://***/?usr=***&msg=***` 这种形式——主机名、路径里的长段（token/正文）和所有查询参数值都会被打码，异常信息里的 path 与查询串也会被清洗，不会泄漏到 Actions 日志。
 
 ---
 
@@ -1262,7 +1397,7 @@ Session Cookie 相当于**临时密码**，拥有它的人可以：
 - **HTTP 库：** requests
 - **CI/CD：** GitHub Actions
 - **配置工具：** HTML + JavaScript (网页版), Python (命令行版)
-- **通知推送：** 钉钉机器人 / SMTP 邮件 / ServerChan
+- **通知推送：** 钉钉机器人 / SMTP 邮件 / ServerChan / 通用 Webhook
 
 ---
 
@@ -1272,7 +1407,8 @@ Session Cookie 相当于**临时密码**，拥有它的人可以：
 |------|------|
 | `checkin.py` | 主签到脚本 |
 | `lottery.py` | 中转站抽奖/翻卡模块（哈基米抽奖、维云翻卡） |
-| `notifier.py` | 通知推送模块（邮件/Server酱） |
+| `notifier.py` | 通知推送模块（邮件 / Server酱 / 通用 Webhook） |
+| `test_notify.py` | Webhook 连通性测试脚本（不执行签到，仅发测试消息） |
 | `dingtalk_notifier.py` | 钉钉通知模块 |
 | `test_checkin.py` | 单站点测试脚本 |
 | `config_helper.py` | 命令行配置助手（交互式）|
