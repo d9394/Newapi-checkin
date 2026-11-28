@@ -8,6 +8,7 @@ NewAPI 自动签到脚本
 import os
 import sys
 import json
+import re
 import time
 import requests
 from datetime import datetime
@@ -45,6 +46,13 @@ try:
 except ImportError:
     lottery_run_for_account = None
     run_gwent_for_account = None
+
+try:
+    import captcha as captcha_solver
+    CAPTCHA_AVAILABLE = captcha_solver.is_available()
+except ImportError:
+    captcha_solver = None
+    CAPTCHA_AVAILABLE = False
 
 
 class NewAPICheckin:
@@ -115,6 +123,7 @@ class NewAPICheckin:
 
         登录接口：POST /api/user/login
         请求体：{"username": x, "password": x}
+        站点开启图形验证码时额外带 captcha_code + captcha_id
         成功时 cookie 中包含新的 session_id
 
         Returns:
@@ -124,55 +133,94 @@ class NewAPICheckin:
             return False
 
         print(f'  [登录] 尝试重新登录...')
-        try:
-            resp = self.session.post(
-                f'{self.base_url}/api/user/login',
-                json={'username': self.login_username, 'password': self.login_password},
-                timeout=30
-            )
 
+        login_body = {'username': self.login_username,
+                      'password': self.login_password}
+
+        def _post_login(extra_fields=None):
+            """发一次登录请求，返回 (resp, data, message)"""
+            body = dict(login_body)
+            if extra_fields:
+                body.update(extra_fields)
+            resp = self.session.post(f'{self.base_url}/api/user/login',
+                                     json=body, timeout=30)
             if resp.status_code == 429:
-                print(f'  [登录] 请求过多 (429)，跳过登录')
-                return False
-
+                return resp, None, '请求过多 (429)'
             try:
                 data = resp.json()
-            except json.JSONDecodeError:
-                content_preview = resp.text[:100] if resp.text else '(空响应)'
-                print(f'  [登录] 响应格式错误 (HTTP {resp.status_code}): {content_preview}')
+            except (ValueError, json.JSONDecodeError):
+                preview = resp.text[:100] if resp.text else '(空响应)'
+                return resp, None, f'响应格式错误 (HTTP {resp.status_code}): {preview}'
+            return resp, data, data.get('message', '')
+
+        def _do_login_with_captcha(fields):
+            resp, data, msg = _post_login(fields)
+            if data is None:
+                return False, {}, msg
+            return bool(data.get('success')), data, msg
+
+        try:
+            data = None
+            resp = None
+
+            if CAPTCHA_AVAILABLE:
+                ok, cdata, cmsg, attempts = captcha_solver.with_captcha_retry(
+                    self.session, self.base_url, _do_login_with_captcha,
+                    scene='login', max_attempts=6)
+                if attempts:
+                    print(f'  [登录] 验证码第 {attempts} 次尝试 -> {cmsg}')
+                if ok:
+                    data = cdata
+                elif attempts and not ('验证码' in (cmsg or '')
+                                       or 'captcha' in (cmsg or '').lower()):
+                    # 验证码已通过，失败是账号密码等真实原因 —— 直接报，不要回退重试
+                    print(f'  [登录] 登录失败: {cmsg}')
+                    return False
+                elif '验证码' in (cmsg or '') or 'captcha' in (cmsg or '').lower():
+                    # 站点确实要验证码，但识别全失败
+                    print(f'  [登录] 登录失败: {cmsg}')
+                    return False
+                # 站点不需要验证码时回退到无验证码登录
+                else:
+                    resp, data, msg = _post_login()
+                    if data is None:
+                        print(f'  [登录] 登录失败: {msg}')
+                        return False
+            else:
+                resp, data, msg = _post_login()
+                if data is None:
+                    print(f'  [登录] 登录失败: {msg}')
+                    return False
+
+            if not data.get('success'):
+                print(f'  [登录] 登录失败: {data.get("message", "未知错误")}')
                 return False
 
-            if resp.status_code == 200 and data.get('success'):
-                # 从响应 cookie 中获取新的 session_id
-                new_session = None
+            # 从响应 cookie 中获取新的 session_id
+            new_session = None
+            if resp is not None:
                 for cookie in resp.cookies:
-                    if cookie.name == 'session' or cookie.name == 'session_id':
+                    if cookie.name in ('session', 'session_id'):
                         new_session = cookie.value
                         break
-
-                if new_session:
-                    self.session_cookie = new_session
-                    self.session.cookies.set('session', new_session)
-                    print(f'  [登录] 登录成功，已更新 session')
-                    return True
-                else:
-                    # 可能 session cookie 在 set-cookie 头中
+                if not new_session:
                     set_cookie = resp.headers.get('Set-Cookie', '')
-                    import re
-                    match = re.search(r'(?:session|session_id)=([^;]+)', set_cookie)
-                    if match:
-                        new_session = match.group(1)
-                        self.session_cookie = new_session
-                        self.session.cookies.set('session', new_session)
-                        print(f'  [登录] 登录成功，已更新 session')
-                        return True
+                    m = re.search(r'(?:session|session_id)=([^;]+)', set_cookie)
+                    if m:
+                        new_session = m.group(1)
 
-                    print(f'  [登录] 登录成功但未获取到新的 session cookie')
-                    return False
-            else:
-                msg = data.get('message', '未知错误')
-                print(f'  [登录] 登录失败: {msg}')
-                return False
+            if not new_session:
+                # 有些站点走 token 认证，cookie 里没有 session
+                new_session = self.session.cookies.get('session') or self.session.cookies.get('session_id')
+
+            if new_session:
+                self.session_cookie = new_session
+                self.session.cookies.set('session', new_session)
+                print(f'  [登录] 登录成功，已更新 session')
+                return True
+
+            print(f'  [登录] 登录成功但未获取到新的 session cookie')
+            return False
 
         except Exception as e:
             print(f'  [登录] 登录请求异常: {e}')
@@ -277,6 +325,57 @@ class NewAPICheckin:
                 traceback.print_exc()
             return None
 
+    def _checkin_with_captcha(self, result: dict) -> dict:
+        """
+        图形验证码签到（new-api 的 graphic_captcha 机制）
+
+        站点返回「图形验证码不能为空」时进入此流程：
+        1. GET /api/captcha?scene=checkin 取 captcha_id + base64 图片
+        2. ddddocr 识别数字/字母
+        3. POST /api/user/checkin 带 captcha_code + captcha_id
+        4. 识别错误则换一张新图重试（captcha_id 一次性，不能复用）
+        """
+        if not CAPTCHA_AVAILABLE:
+            reason = captcha_solver.unavailable_reason() if captcha_solver else '模块未加载'
+            result['message'] = f'站点要求图形验证码但无法识别: {reason}'
+            print(f'  [验证码] 不可用: {reason}')
+            return result
+
+        print('  [验证码] 开始图形验证码签到（OCR）...')
+
+        def do_request(fields):
+            resp = self.session.post(
+                f'{self.base_url}/api/user/checkin',
+                json={'captcha_code': fields['captcha_code'],
+                      'captcha_id': fields['captcha_id']},
+                timeout=25)
+            try:
+                data = resp.json()
+            except Exception:
+                return False, {}, f'HTTP {resp.status_code} 响应非 JSON'
+            return bool(data.get('success')), data, data.get('message', '')
+
+        ok, data, msg, attempts = captcha_solver.with_captcha_retry(
+            self.session, self.base_url, do_request, scene='checkin')
+
+        print(f'  [验证码] 第 {attempts} 次尝试 -> {msg}')
+
+        if ok:
+            result['success'] = True
+            result['message'] = msg or '签到成功'
+            cd = data.get('data') or {}
+            result['checkin_date'] = cd.get('checkin_date')
+            result['quota_awarded'] = cd.get('quota_awarded')
+            return result
+
+        already_keywords = ['已签到', '已经签到', 'already', '重复签到']
+        if any(k in (msg or '').lower() for k in already_keywords):
+            result['success'] = True
+            result['message'] = msg
+        else:
+            result['message'] = f'图形验证码签到失败: {msg}'
+        return result
+
     def checkin(self) -> dict:
         """
         执行签到
@@ -361,6 +460,10 @@ class NewAPICheckin:
                         # 站点开启 PoW 工作量证明，本地直接解算后重签
                         print(f'[PoW] 站点要求工作量证明: {message}')
                         return self._checkin_with_pow(result)
+                    elif '验证码' in message or 'captcha' in message.lower():
+                        # 站点要求图形验证码，OCR 识别后重签
+                        print(f'[验证码] 站点要求图形验证码: {message}')
+                        return self._checkin_with_captcha(result)
                     elif 'turnstile' in message.lower():
                         # 站点开启 Turnstile 人机验证，走真实浏览器解验证后重签
                         print(f'[Turnstile] 站点要求人机验证: {message}')
